@@ -1,0 +1,67 @@
+Generate HTML output for given SQL Query
+
+http://www.sqlservercentral.com/scripts/61220/
+
+ Create this Sp in your server
+
+...and then execute exec [SPGET_QUERY_HTML] 'select top 11 * from DIM_CARD '
+
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+--exec [SPGET_QUERY_HTML] 'select top 11 * from DIM_CARD '
+
+CREATE procedure [SPGET_QUERY_HTML]( @p_sqlstmt varchar(8000))
+as
+
+declare @columns varchar(8000)
+declare @finalhtmlout varchar(8000)
+declare @colHeader varchar(8000)
+declare @Final varchar(8000) 
+Declare @sqlstmt varchar(8000)
+
+-- drop temporary tables used.
+IF EXISTS (SELECT * FROM tempdb.sys.objects WHERE name = '##TEMPhtml1')
+DROP TABLE ##TEMPhtml1
+
+IF EXISTS (SELECT * FROM tempdb.sys.objects WHERE name = '##TEMPhtml2') 
+DROP TABLE ##TEMPhtml2
+
+-- prepare query
+set @sqlstmt = 'select * into ##tempHTML1 from (' + @p_sqlstmt + ') as T1'
+execute (@sqlstmt)
+
+--Prepare columns details
+SELECT ????@columns = COALESCE(@columns + ' + '' </td><td> '' + ', '') + 'convert(varchar(100),isnull(' + column_name +','' ''))'
+FROM tempdb.information_schema.columns where table_name='##tempHTML1'
+
+--Prepare column Header
+set @colHeader = '<tr bgcolor=#EDFEDF align=center>'
+SELECT @colHeader = @colHeader + '<td><b> ' + column_name + '</b></td>'
+FROM tempdb.information_schema.columns where table_name='##tempHTML1'
+set @colHeader=@colHeader + '</tr>'
+
+--prepare final output
+set @Final= 'Select ''<tr><td>'' + ' + @columns + ' ''</td></tr> '' into ##tempHTML2 from ##tempHTML1 ' 
+execute( @Final)
+set @finalhtmlout= ' <html> <body><style type="text/css" media="all"> table { margin-bottom: 2em; border-collapse: collapse } td,th {border= 1 solid #999; padding: 0.2em 0.2em; font-size: 12;} </style> <table width="100%"> ' + @colHeader
+select @finalhtmlout= @finalhtmlout + [</td></tr>] from ##tempHTML2
+set @finalhtmlout= @finalhtmlout + ' </table></body></htmL>'
+
+
+-- drop temporary tables used.
+IF EXISTS (SELECT * FROM tempdb.sys.objects WHERE name = '##TEMPhtml1')
+DROP TABLE ##TEMPhtml1
+
+IF EXISTS (SELECT * FROM tempdb.sys.objects WHERE name = '##TEMPhtml2') 
+DROP TABLE ##TEMPhtml2
+
+--return final output
+select @finalhtmlout as HTMLoutput
+
+
+
+
+
+

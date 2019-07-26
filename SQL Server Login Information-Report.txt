@@ -1,0 +1,89 @@
+--SQL Server Login Information
+
+http://www.sqlservercentral.com/scripts/Logins/88081/
+
+--Logins Information
+select name, create_date, modify_date, default_database_name, type_desc
+from sys.server_principals 
+where type not in ('R', 'C')
+
+--Login Server Roles
+select name, 
+case when bulkadmin = 1 then 'YES' else 'NO' end as IsBulkAdmin,
+case when dbcreator = 1 then 'YES' else 'NO' end as IsDBCreater,
+case when diskadmin = 1 then 'YES' else 'NO' end as IsDiskAdmin,
+case when Processadmin = 1 then 'YES' else 'NO' end as IsProcessAdmin,
+case when securityadmin = 1 then 'YES' else 'NO' end as IsSecurityAdmin,
+case when serveradmin = 1 then 'YES' else 'NO' end as IsServerAdmin,
+case when setupadmin = 1 then 'YES' else 'NO' end as IsSetupAdmin,
+case when sysadmin = 1 then 'YES' else 'NO' end as IsSysAdmin
+from sys.syslogins
+where name not like '#%#'
+
+
+--Logins Database mappings
+if exists (select 1 from sys.objects where name = 'LoginDBRoleMemebers' and type = 'U')
+????begin
+????????truncate table LoginDBRoleMemebers
+????end
+else
+????begin
+????????create table LoginDBRoleMemebers(
+????????????DbRole????????sysname,
+????????????MemberName????sysname,
+????????????MemberSID????varbinary(85),
+????????????DBName????????varchar(128),
+????????)
+????end
+
+if exists (select 1 from sys.objects where name = 'tmp_LoginDBRoleMemebers' and type = 'U')
+????begin
+????????truncate table tmp_LoginDBRoleMemebers
+????end
+else
+????begin
+????????create table tmp_LoginDBRoleMemebers(
+????????????DbRole????????sysname,
+????????????MemberName????sysname,
+????????????MemberSID????varbinary(85),
+????????)
+????end
+
+declare @dbname varchar(128), @sql varchar(500)
+declare LoginMapping_cursor cursor for
+--get all user databases
+select name from sys.databases where database_id > 4 
+
+open LoginMapping_cursor
+
+fetch next from LoginMapping_cursor
+into @dbname
+
+while @@fetch_status = 0
+begin
+
+????select @sql = 'use ' + @dbname + ' ' + 'exec sp_helprolemember'????
+????insert into tmp_LoginDBRoleMemebers
+????exec (@sql)
+????insert into LoginDBRoleMemebers (DbRole, MemberName, MemberSID, DBName)
+????select DbRole, MemberName, MemberSID, @dbname from tmp_LoginDBRoleMemebers 
+
+????truncate table ????tmp_LoginDBRoleMemebers
+
+????fetch next from LoginMapping_cursor
+????into @dbname
+end
+
+close LoginMapping_cursor
+deallocate LoginMapping_cursor
+
+select MemberName as LoginName, DBName, DBRole 
+from LoginDBRoleMemebers where MemberName <> 'dbo'
+order by MemberName
+
+drop table LoginDBRoleMemebers
+drop table tmp_LoginDBRoleMemebers
+
+
+
+

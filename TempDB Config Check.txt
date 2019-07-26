@@ -1,0 +1,99 @@
+http://sqlserverzest.com/2014/06/24/sql-server-script-to-configure-tempdb-files-per-number-of-logical-processors/
+
+
+https://www.mssqltips.com/sqlservertip/1432/tempdb-configuration-best-practices-in-sql-server/
+
+https://www.mssqltips.com/sql-server-tip-category/60/database-administration/
+
+
+https://www.mssqltips.com/ss.asp?id=2773&link=https://www.mssqltips.com/get-free-sql-server-tips/?ref=990x30
+
+https://www.mssqltips.com/sqlservertip/2097/how-to-shrink-the-transaction-log-file-in-sql-server/
+
+
+https://www.mssqltips.com/sqlservertip/3690/identify-sql-server-database-growth-rates/
+
+https://www.mssqltips.com/sqlservertip/3212/options-to-move-a-big-sql-server-database-to-a-new-drive-with-minimal-downtime/
+
+
+
+https://www.mssqltips.com/sqlservertip/2275/sql-server-2008-transaction-logging-enhancements/
+
+https://www.mssqltips.com/sqlservertip/2092/sql-server-transaction-log-grows-and-fills-up-drive/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+http://sqlserverzest.com/2014/06/24/sql-server-script-to-configure-tempdb-files-per-number-of-logical-processors/
+
+SQL Server – Script to Configure TempDB Files per Number of Logical Processors
+
+
+
+In order to reduce Tempdb contention one of  the best practices is to maintain multiple sized Tempdb data files, matching the number of processors and up to a maximum of 8. 
+
+In this post I will show  you T-SQL script to identify current Tempdb configuration and number of logical processors along with adding additional Tempdb data files as required.
+
+Script 1: Find current tempdb configuration
+
+
+select DB_NAME(mf.database_id) database_name
+, mf.name logical_name, mf.file_id
+, CONVERT (DECIMAL (20,2)
+, (CONVERT(DECIMAL, size)/128)) as [file_size_MB]
+, CASE mf.is_percent_growth
+WHEN 1 THEN 'Yes'
+ELSE 'No'
+END AS [is_percent_growth]
+, CASE mf.is_percent_growth
+WHEN 1 THEN CONVERT(VARCHAR, mf.growth) + '%'
+WHEN 0 THEN CONVERT(VARCHAR, mf.growth/128) + ' MB'
+END AS [growth_in_increment_of]
+, CASE mf.is_percent_growth
+WHEN 1 THEN CONVERT(DECIMAL(20,2)
+,(((CONVERT(DECIMAL, size)*growth)/100)*8)/1024)
+WHEN 0 THEN CONVERT(DECIMAL(20,2)
+, (CONVERT(DECIMAL, growth)/128))
+END AS [next_auto_growth_size_MB]
+, physical_name from sys.master_files mf
+where database_id =2 and type_desc= 'rows'
+
+Script 2: Find number of logical processors
+
+SELECT cpu_count AS logicalCPUs FROM sys.dm_os_sys_info
+
+Script 3: Add tempdb data files as per processor count from the above query
+
+ALTER DATABASE tempdb ADD FILE ( NAME = N'tempdev2',
+FILENAME = N'D:\DBA\Data\tempdev2.ndf' , SIZE =8MB , FILEGROWTH = 5MB) --<<--Update the data file location/Size/AutoGrowth
+GO
+
+ALTER DATABASE tempdb ADD FILE ( NAME = N'tempdev3',
+FILENAME = N'D:\DBA\Data\tempdev3.ndf' , SIZE =8MB , FILEGROWTH = 5MB)--<<--Update the data file location/Size/AutoGrowth
+GO
+---ETC, add files as per processors count
+
+Reboot/Restart of SQL services is not required for making the tempdb changes. Here is a great post that explains how to best remove extra Tempdb files.

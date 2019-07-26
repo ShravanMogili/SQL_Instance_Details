@@ -1,0 +1,114 @@
+--Central Management Server Daily Script
+ As with any script please test these in a development environment before using them against a produciton database server or central management server.
+
+Feel free to post any recommendations and even additional scripts to this to improve the value of these "CMS" morning report scripts. 
+
+--Purpose: Check servers registered in Central Management Server under
+--	a grouping like Production_Servers.
+--	Note: to display each query as one result for all registered servers
+--	      change Query Options > Results > Multiserver > Merge results to true
+--HawkeyeDBA
+
+
+--Check morning statistics *note: this resets counters at the end to get an accurate--daily reading of wait stats
+WITH Waits AS
+(SELECT @@SERVERNAME as servername, 
+wait_type, wait_time_ms / 1000. AS wait_time_s,
+100. * wait_time_ms / SUM(wait_time_ms) OVER() AS pct,
+ROW_NUMBER() OVER(ORDER BY wait_time_ms DESC) AS rn
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN ('CLR_SEMAPHORE','LAZYWRITER_SLEEP','RESOURCE_QUEUE','SLEEP_TASK','SLEEP_SYSTEMTASK','SQLTRACE_BUFFER_FLUSH','WAITFOR', 'LOGMGR_QUEUE','CHECKPOINT_QUEUE','REQUEST_FOR_DEADLOCK_SEARCH','XE_TIMER_EVENT','BROKER_TO_FLUSH','BROKER_TASK_STOP','CLR_MANUAL_EVENT','CLR_AUTO_EVENT','DISPATCHER_QUEUE_SEMAPHORE', 'FT_IFTS_SCHEDULER_IDLE_WAIT','XE_DISPATCHER_WAIT', 'XE_DISPATCHER_JOIN'))
+
+SELECT W1.wait_type, w1.servername,
+CAST(W1.wait_time_s AS DECIMAL(12, 2)) AS wait_time_s,
+CAST(W1.pct AS DECIMAL(12, 2)) AS pct,
+CAST(SUM(W2.pct) AS DECIMAL(12, 2)) AS running_pct
+INTO #waitstats
+FROM Waits AS W1
+INNER JOIN Waits AS W2
+ON W2.rn <= W1.rn
+GROUP BY W1.rn, W1.wait_type, W1.wait_time_s, W1.pct, W1.servername
+HAVING SUM(W2.pct) - W1.pct < 95;  
+SELECT GETDATE() as TodaysDate, @@SERVERNAME as servername,
+LEFT(SUBSTRING(@@VERSION, PATINDEX('%[2000-2008]%', @@VERSION), LEN(@@VERSION)), 4) SQLVersion,
+LEFT(SUBSTRING(@@VERSION, PATINDEX('%[8.00.00-10.50.2500]%', @@VERSION), LEN(@@VERSION)), 25) SQLBuild, 
+count(spid) as ProcessCount,
+(SELECT MIN(login_time) FROM ..sysprocesses  WHERE loginame NOT LIKE '<list of user logins to exclude - I just use my own') as LastRestart 
+INTO #sysinfoFROM ..sysprocesses 
+WHERE loginame NOT IN('sa', '<Agent Service account>', '<SQL Service account>') 
+SELECT p1.*, ( SELECT + wait_type + ' ' + CONVERT(varchar(50), wait_time_s) + ', '  
+               FROM #waitstats p2 
+               WHERE p2.servername = p1.servername 
+               ORDER BY wait_type FOR XML PATH('') ) AS ColumnList 
+FROM #sysinfo p1 
+GROUP BY p1.ServerName, p1.TodaysDate, p1.SQLVersion, p1.SQLBuild, p1.ProcessCount, p1.LastRestart;
+
+--cleanup temporary objects
+DROP TABLE #waitstats;
+DROP TABLE #sysinfo;
+
+--Now clear the wait stats to start accumulation for tomorrow's report
+DBCC SQLPERF("sys.dm_os_wait_stats",CLEAR);
+
+--Report failed jobs
+SELECT
+????@@Servername, 
+????b.[name] AS job_name, 
+????CONVERT(VARCHAR, a.run_date), 
+????a.step_id AS step_number,
+????a.step_name, 
+????@@ServerName,
+????a.run_duration,
+????LEFT(a.[message], 255) AS JobMessage
+FROM msdb.dbo.sysjobhistory a
+INNER JOIN msdb.dbo.sysjobs b ON
+????a.job_id = b.job_id
+WHERE 
+????CONVERT(Varchar, a.run_date) >= CONVERT(Varchar,GetDate() -3, 112) AND
+????a.run_status = 0 AND
+????a.step_name NOT LIKE '(Job outcome)'
+
+
+--Report any currently running jobs
+SELECT @@servername, b.name as job_name, a.start_execution_date
+from msdb..sysjobactivity a
+INNER JOIN msdb..sysjobs b on
+????a.job_id = b.job_id
+WHERE start_execution_date >= GETDATE()-1 and stop_execution_date is NULL;
+
+--Report Missing Backups
+--You have to enter the date values for the dynamic sql
+--This does NOT look at log backups only full or differential 
+CREATE TABLE #BkpDate (BkpDate datetime, dbname varchar(100))
+
+Exec sp_MsForEachDb @command1 = '
+Insert into #BkpDate(BkpDate, dbname) VALUES(''05/06/2012'', ''?'')
+Insert into #BkpDate(BkpDate, dbname) VALUES(''05/07/2012'', ''?'')
+Insert into #BkpDate(BkpDate, dbname) VALUES(''05/08/2012'', ''?'')
+--etc...
+'
+DELETE FROM #BkpDate WHERE dbname in('tempdb', 'model', 'pubs', '<enter any other database you wish to exclude>')
+SELECT *
+FROM #BkpDate
+LEFT JOIN(SELECT 
+????????????CONVERT(varchar, CONVERT(datetime, msdb.dbo.backupset.backup_finish_date, 101), 101) as finish_date,
+???????????? msdb.dbo.backupset.database_name, msdb.dbo.backupset.backup_size/1000/1000 as backupsizeMB
+????????????FROM 
+????????????????msdb.dbo.backupmediafamily 
+????????????INNER JOIN msdb.dbo.backupset 
+????????????ON msdb.dbo.backupmediafamily.media_set_id = msdb.dbo.backupset.media_set_id
+????????????WHERE msdb..backupset.type LIKE 'D' or msdb..backupset.type LIKE 'I') query ON
+BkpDate = finish_date AND
+DbName = database_name
+ ORDER BY database_name, BkpDate
+ 
+--cleanup temp table
+DROP TABLE #BkpDate
+
+--Finally just get a quick glimpse of what is left for drive space, this is not
+--meant to "track disk space" rather just to give a quick look
+CREATE TABLE #DriveSpace (DriveLetter char(1), MBFree float)
+INSERT INTO #DriveSpace
+exec xp_fixeddrives;
+SELECT DriveLetter, MBFree FROM #DriveSpace;
+DROP TABLE #DriveSpace;

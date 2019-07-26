@@ -1,0 +1,885 @@
+Script to create a standby database server(new).
+
+New feature to relocate files on the secondary server has been added to this script. If you don't need this feature please use my other script that is posted on this website.
+Run this script on a secondary SQL Server to replicate the data of all the user databases from the primary server every 15 minutes. Full sync is done at 9pm every night. Please try this script in the development environment first to make sure that you are completely satisfied and it suits your requirement.
+
+
+
+
+/* ---------------------------------------------------------------------------------------------------- */
+/* Instructions		:	Read the instructions below before executing this scripts. 		*/
+/* ---------------------------------------------------------------------------------------------------- */
+/* Script Name		:	StandBySecondaryServer.SQL						*/
+/* Owner		:	Bodhayan K. Sharma							*/
+/* Created On		:	July 10, 2002								*/
+/* ---------------------------------------------------------------------------------------------------- */
+/* Purpose		:	To Setup the Secondary Server as the StandyBY database server for all	*/
+/*				user databases on the primary server. This script will install all the 	*/
+/*				SQL Server jobs required to perform the standby function.		*/
+/* Pre-requisites	:	Both the servers i.e. primary and the secondary server should be running*/
+/*				under a domain user account.						*/
+/* Search & Replace 	:	Search and replace the following variables with the right values:-	*/
+/*				1. PrimaryServerName							*/
+/*				2. SecondaryServerName							*/
+/*				3. SecondaryServerDataDrive e.g. with D if the data dir is on D Drive	*/
+/*				4. PrimaryServerDataDrive e.g. with E if the data dir is on E Drive     */
+/* Execution		:	Press Ctrl+E to execute this scripts.					*/
+/* Error Reporting	:	Contact the owner for any assistance or reporting an error.		*/
+/* FailoverToSecondary	:	Using Enterprise Manager run the FailoverToSecondary job if the primary */
+/*				server is no longer available. Make changes to your application to point*/
+/*				to the secondary server after running this job.				*/
+/* FailoverToPrimary	:	Using Enterprise Manager run the FailoverToPrimary job if the primary   */
+/*				is back online. Make changes to your application to point to the primary*/
+/*				server after running this job.						*/
+/* ---------------------------------------------------------------------------------------------------- */
+/* Modified By		:	Bodhayan K. Sharma							*/
+/* Modified On		:	August 09,2002								*/
+/* Modification Details :	Removed Usp_RestoreForStandBy and Added Usp_RestoreForStandByWithMove	*/
+/*				stored procedure. This new stored procedure allows to relocate files on */
+/*				the standby server. Two new parameters have been added. One to know if  */
+/*				if relocation has to be done and the other to know the drive where files*/
+/*				have to be relocated.							*/
+/* ---------------------------------------------------------------------------------------------------- */
+
+/* Create the Usp_RestoreForStandByWithMove Stored Procedure */
+/* --------------------------------------------------------- */
+if exists (select * from dbo.sysobjects where id = object_id(N'[dbo].[Usp_RestoreForStandByWithMove]') and OBJECTPROPERTY(id, N'IsProcedure') = 1)
+drop procedure [dbo].[Usp_RestoreForStandByWithMove]
+GO
+
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+create procedure 
+		Usp_RestoreForStandByWithMove
+		(
+			@lsPrimarySQLServerName 	varchar(50),
+			@lsSecondarySQLServerName	varchar(50),
+			@lsBackupType			varchar(3) = 'DB',
+			@lsStandBy 			varchar(5) = 'FALSE',
+			@lsRelocateFilesYesNo		char(1) = 'N',
+			@lsRelocateFilesTo		Char(1) = Null
+		)
+as
+begin
+
+	/* declare local variables */
+	/* ----------------------- */
+	declare @object 		int
+	declare @objBackup		int
+	declare @objRestore		int
+	declare @src 			varchar(255)
+	declare @desc 			varchar(255)
+	declare @hr			int
+	declare @lsDBName		sysname
+	declare @liDBCount		int
+	declare @liDBincr		int
+	declare @lsCommand		varchar(4000)
+	declare @tblDBList	 	table 
+					(DBName 	sysname,
+					LogicalName 	Varchar(256), 
+					Physicalname 	Varchar(520))
+	declare @LogicalName		varchar(256)
+	declare @PhysicalName		varchar(520)
+	declare @liRetry		int
+	declare @lsBackupDirectory	varchar(255)
+	declare @lsBackupFileName	sysname
+	declare @liBackupAction		int
+	declare @liRestoreAction	int
+	declare @lsMachineName		sysname
+--	declare @lsSecondarySQLServerName	varchar(50)
+	declare @liFGCount 		int
+	declare @liFGIncr 		int
+	declare @liDBFCount 		int
+	declare @liDBFIncr 		int
+	declare @liLFCount 		int
+	declare @liLFIncr 		int
+	declare @lsRelocateFiles	varchar(4000)
+
+	/* declare the cursor to get the list of all the user database on the primary server */
+	/* --------------------------------------------------------------------------------- */
+	declare 
+		lcurDBList
+	cursor for
+		select * from @tblDBList
+
+
+	/* initialize variables */
+	/* -------------------- */
+
+--	select @lsSecondarySQLServerName = @@SERVERNAME 
+
+	if Upper(@lsBackupType) = 'DB' 		-- initialize the backyp type i.e. database or log
+	begin
+		set @liBackupAction = 0
+		set @liRestoreAction = 0
+	end
+	else
+	begin
+		set @liBackupAction = 3
+		set @liRestoreAction = 2
+	end
+
+
+	/* create an instance of primary server */
+	/* ------------------------------------ */
+	EXEC @hr = sp_OACreate 'SQLDMO.SQLServer', @object OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* create an instance of backup object */
+	/* ----------------------------------- */
+	EXEC @hr = sp_OACreate 'SQLDMO.Backup', @objBackup OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* connect to the primary server */
+	/* ----------------------------- */
+	EXEC @hr = sp_OASetProperty @object, 'LoginSecure',True
+	IF @hr <> 0 goto DestroyObj
+
+	set @liRetry = 1
+	set @hr = 1
+	while (@liRetry <= 5 and @hr <> 0)
+	begin
+		EXEC @hr = sp_OAMethod @object, 'Connect', NULL, @lsPrimarySQLServerName
+		if @hr <> 0 waitfor delay '000:00:15'
+		set @liRetry = @liRetry + 1
+	end
+	IF @hr <> 0 goto DestroyObj
+
+	/* get the count of user database on the primary server */
+	/* ---------------------------------------------------- */
+	EXEC @hr = sp_OAGetProperty @Object, 'databases.count', @liDBCount OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* get the database name of each user database on the primary server */
+	/* ----------------------------------------------------------------- */
+	set @liDBincr = 1
+	while (@liDBincr <= @liDBCount)
+	begin
+		select @lsCommand = 'databases.item(' + convert(varchar(2),@liDBincr) + ').name'
+		EXEC @hr = sp_OAGetProperty @Object,@lsCommand, @lsDBName OUT		
+		IF @hr <> 0 goto DestroyObj
+
+		/* work only on user databases */
+		/* --------------------------- */
+		if lower(@lsDBName) <> 'master' and lower(@lsDBName) <> 'model' and lower(@lsDBName) <> 'msdb' and lower(@lsDBName) <> 'tempdb' and lower(@lsDBName) <> 'pubs' and lower(@lsDBName) <> 'northwind' and lower(@lsDBName) <> 'sqlhelpdesk'
+		begin
+			If Upper(@lsRelocateFilesYesNo) = 'N'
+			begin
+				insert @tblDBList values(@lsDBName,'','')
+			end
+			else
+			begin
+				select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').filegroups.count'
+				EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@liFGCount OUT
+				IF @hr <> 0 goto DestroyObj
+				select @liFGincr = 1
+				while @liFGincr <= @liFGCount
+				begin
+	
+					select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').filegroups('+convert(varchar(2),@liFGincr)+').dbfiles.count'
+					EXEC @hr = sp_OAGetProperty @Object,@lsCommand, @liDBFCount OUT
+					IF @hr <> 0 goto DestroyObj
+					select @liDBFincr = 1
+					while @liDBFincr <= @liDBFCount
+					begin
+						select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').filegroups('+convert(varchar(2),@liFGincr)+').dbfiles('+convert(varchar(2),@liDBFincr)+').Name'
+						EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@LogicalName OUT
+						IF @hr <> 0 goto DestroyObj
+						select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').filegroups('+convert(varchar(2),@liFGincr)+').dbfiles('+convert(varchar(2),@liDBFincr)+').PhysicalName'
+						EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@PhysicalName OUT
+						IF @hr <> 0 goto DestroyObj
+						select @liDBFincr = @liDBFincr + 1
+						insert @tblDBList values(@lsDBName,@LogicalName,@PhysicalName)
+					end
+					select @liFGincr = @liFGincr + 1
+				end
+				/* get the transaction log properties */
+				/* ---------------------------------- */
+				select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').TransactionLog.LogFiles.count'
+				EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@liLFCount OUT
+				IF @hr <> 0 goto DestroyObj
+				select @liLFincr = 1
+				while @liLFincr <= @liLFCount
+				begin
+					select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').TransactionLog.LogFiles('+convert(varchar(2),@liLFincr)+').Name'
+					EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@LogicalName OUT
+					IF @hr <> 0 goto DestroyObj
+					select @lsCommand = 'databases(' + convert(varchar(2),@liDBincr) + ').TransactionLog.LogFiles('+convert(varchar(2),@liLFincr)+').PhysicalName'
+					EXEC @hr = sp_OAGetProperty @Object,@lsCommand,@PhysicalName OUT
+					IF @hr <> 0 goto DestroyObj
+					select @liLFincr = @liLFincr + 1
+					insert @tblDBList values(@lsDBName,@LogicalName,@PhysicalName)
+				end
+			end
+		end
+		set @liDBincr = @liDBincr + 1
+	end
+
+	/* Update the temp table with the new drive location */
+	/* ------------------------------------------------- */
+	If Upper(@lsRelocateFilesYesNo) = 'Y' and Upper(@lsRelocateFilesTo) is Not Null
+	begin
+		Update
+			@tblDBList
+		set
+			PhysicalName = @lsRelocateFilesTo + substring(PhysicalName,2,len(PhysicalName))
+	end
+
+	/* get the backup directory of the primary server */
+	/* ----------------------------------------------- */
+	select @lsCommand = 'registry.BackupDirectory'
+	EXEC @hr = sp_OAGetProperty @Object,@lsCommand, @lsBackupDirectory OUT		
+	IF @hr <> 0 goto DestroyObj
+
+	/* get the machine name of the secondary server */
+	/* -------------------------------------------- */
+	EXEC @hr = sp_OAGetProperty @Object,'NetName', @lsMachineName OUT		
+	if @hr <> 0 goto DestroyObj
+
+
+	/* for each user database on the primary server perform the full or log backup */
+	/* --------------------------------------------------------------------------- */
+	open lcurDBlist
+	fetch next from
+		lcurDBlist
+	into
+		@lsDBName,
+		@LogicalName,
+		@Physicalname
+
+
+	while (@@fetch_status = 0)
+	begin
+	
+		/* set the database name property of the backup object */
+		/* --------------------------------------------------- */
+		EXEC @hr = sp_OASetProperty @objBackup, 'Database',@lsDBName
+		if @hr <> 0 goto DestroyObj
+		
+		/* set the database action property of the backup object */
+		/* ----------------------------------------------------- */
+		EXEC @hr = sp_OASetProperty @objBackup, 'Action',@liBackupAction
+		if @hr <> 0 goto DestroyObj
+		
+		/* set the database initialize property of the backup object */
+		/* --------------------------------------------------------- */
+		EXEC @hr = sp_OASetProperty @objBackup, 'Initialize',True
+		if @hr <> 0 goto DestroyObj
+		
+		/* set the files property of the backup object */
+		/* ------------------------------------------- */
+		if @liBackupAction = 0
+		begin
+			set @lsBackupFileName = @lsBackupDirectory + '\' + @lsDBName + 'DailyFullBackup.bak'
+		end
+		else
+		begin
+			set @lsBackupFileName = @lsBackupDirectory + '\' + @lsDBName + 'DailyTlogBackup.trn'
+		end
+		EXEC @hr = sp_OASetProperty @objBackup, 'Files',@lsBackupFileName
+		if @hr <> 0 goto DestroyObj
+
+		/* call the sqlbackup method to start the backup */
+		/* --------------------------------------------- */
+		EXEC @hr = sp_OAMethod @objBackup,'SQLBackup',null,@object
+		IF @hr <> 0 goto DestroyObj
+
+		fetch next from
+			lcurDBlist
+		into
+			@lsDBName,
+			@LogicalName,
+			@PhysicalName
+	end
+
+	close lcurDBlist
+		
+
+	/* disconnect and destory the instance of primary server and backup object */
+	/* ----------------------------------------------------------------------- */
+	EXEC @hr = sp_OAMethod @object, 'DisConnect'
+	EXEC @hr = sp_OADestroy @object
+	Exec @hr = sp_OADestroy @objbackup
+
+	/* create an instance of secondary server */
+	/* -------------------------------------- */
+	EXEC @hr = sp_OACreate 'SQLDMO.SQLServer', @object OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* create a instance of restore object */
+	/* ----------------------------------- */
+	EXEC @hr = sp_OACreate 'SQLDMO.Restore', @objRestore OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* connect to the secondary server */
+	/* ------------------------------- */
+	EXEC @hr = sp_OASetProperty @object, 'LoginSecure',True
+	IF @hr <> 0 goto DestroyObj
+
+	set @liRetry = 1
+	set @hr = 1
+	while (@liRetry <= 5 and @hr <> 0)
+	begin
+		EXEC @hr = sp_OAMethod @object, 'Connect', NULL, @lsSecondarySQLServerName
+		if @hr <> 0 waitfor delay '000:00:15'
+		set @liRetry = @liRetry + 1
+	end
+	IF @hr <> 0 goto DestroyObj
+
+
+	/* for each user database on the seconary server perform the full or log restore */
+	/* ----------------------------------------------------------------------------- */
+	open lcurDBlist
+	fetch next from
+		lcurDBlist
+	into
+		@lsDBName,
+		@LogicalName,
+		@PhysicalName
+
+	while (@@fetch_status = 0)
+	begin
+	
+		/* set the database name property of the restore object */
+		/* ---------------------------------------------------- */
+		EXEC @hr = sp_OASetProperty @objRestore, 'Database',@lsDBName
+		if @hr <> 0 goto DestroyObj
+		
+		/* set the database action property of the restore object */
+		/* ------------------------------------------------------ */
+		EXEC @hr = sp_OASetProperty @objRestore, 'Action',@liRestoreAction
+		if @hr <> 0 goto DestroyObj
+		
+
+		/* replace the colon with a dollar sign */
+		/* ------------------------------------ */
+		set @lsBackupDirectory = replace(@lsBackupDirectory,':','$')
+		set @lsBackupFileName = '\\'+@lsMachineName+'\'+@lsBackupDirectory + '\' + @lsDBName
+
+		/* set the files property of the restore object */
+		/* -------------------------------------------- */
+
+		if @liRestoreAction = 0
+		begin
+			set @lsBackupFileName = @lsBackupFileName + 'DailyFullBackup.bak'
+		end
+		else
+		begin
+			set @lsBackupFileName = @lsBackupFileName + 'DailyTlogBackup.trn'
+		end
+
+		EXEC @hr = sp_OASetProperty @objRestore, 'Files',@lsBackupFileName
+		if @hr <> 0 goto DestroyObj
+
+		/* set the relocatefiles property of the restore object */		
+		/* ---------------------------------------------------- */
+		if Upper(@lsRelocateFilesYesNo) = 'Y' and Upper(@lsRelocateFilesTo) is Not Null
+		begin
+			set @lsRelocateFiles = ""
+			Update
+				@tblDBList
+			set
+				@lsRelocateFiles = @lsRelocateFiles + rtrim(a.LogicalName) + ',' + rtrim(a.PhysicalName) + ','
+			from
+				@tblDBList a
+			where
+				a.DBName = @lsDBName
+	
+			set @lsRelocateFiles = substring(@lsRelocateFiles,1,len(@lsRelocateFiles)-1)
+		
+			EXEC @hr = sp_OASetProperty @objRestore, 'RelocateFiles',@lsRelocateFiles
+			if @hr <> 0 goto DestroyObj
+		end
+
+		/* set the last restore property based on action property */
+		/* ------------------------------------------------------ */
+		if Upper(@lsStandBy) = 'FALSE'
+		begin
+			EXEC @hr = sp_OASetProperty @objRestore, 'LastRestore',True
+			IF @hr <> 0 goto DestroyObj
+		end
+		else
+		begin
+			EXEC @hr = sp_OASetProperty @objRestore, 'LastRestore',False
+			IF @hr <> 0 goto DestroyObj
+		end
+
+		/* call the sqlbackup method to start the backup */
+		/* --------------------------------------------- */
+		EXEC @hr = sp_OAMethod @objRestore,'SQLRestore',null,@object
+		IF @hr <> 0 goto DestroyObj
+
+		fetch next from
+			lcurDBlist
+		into
+			@lsDBName,
+			@LogicalName,
+			@PhysicalName
+			
+	end
+
+	close lcurDBlist
+	deallocate lcurDBlist
+		
+	/* disconnect and destroy the instance of secondary server and restore object */
+	/* -------------------------------------------------------------------------- */
+	EXEC @hr = sp_OAMethod @object, 'DisConnect'
+	EXEC @hr = sp_OADestroy @object
+	Exec @hr = sp_OADestroy @objRestore
+	/* Destroy the sql server object */
+	/* ----------------------------- */
+	DestroyObj:
+	IF @hr <> 0
+	BEGIN
+		EXEC sp_OAGetErrorInfo @object, @src OUT, @desc OUT 
+		exec master..xp_logEvent 60000,@src,Error
+		exec master..xp_logEvent 60000,@desc,Error
+
+		EXEC sp_OAGetErrorInfo @objBackup, @src OUT, @desc OUT 
+		exec master..xp_logEvent 60000,@src,Error
+		exec master..xp_logEvent 60000,@desc,Error
+
+		EXEC sp_OAGetErrorInfo @objRestore, @src OUT, @desc OUT 
+		exec master..xp_logEvent 60000,@src,Error
+		exec master..xp_logEvent 60000,@desc,Error
+
+		exec master..xp_logevent 60000,@lsPrimarySQLServerName,Error
+		exec master..xp_logevent 60000,@lsDBName,Error
+		exec master..xp_logevent 60000,@lsBackupFileName,Error
+		exec master..xp_logevent 60000,'Error while executing Usp_RestoreForStandByWithMove procedure...',Error
+
+		close lcurDBlist
+		deallocate lcurDBlist
+	END
+	EXEC @hr = sp_OAMethod @object, 'DisConnect'
+	EXEC @hr = sp_OADestroy @object
+	Exec @hr = sp_OADestroy @objbackup
+	Exec @hr = sp_OADestroy @objRestore
+
+end
+-- usp_RestoreForStandByWithMove 'PrimaryServerName','SecondaryServerName','DB','TRUE','Y','SecondaryServerDataDrive'
+-- usp_RestoreForStandByWithMove 'PrimaryServerName','SecondaryServerName','LOG','TRUE','Y','SecondaryServerDataDrive'
+-- master..xp_readerrorlog
+-- sp_cycle_errorlog
+
+
+
+GO
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+/* Create the RecoverStandByDatabase stored procedure */
+/* -------------------------------------------------- */
+if exists (select * from dbo.sysobjects where id = object_id(N'[dbo].[Usp_RecoverStandByDatabase]') and OBJECTPROPERTY(id, N'IsProcedure') = 1)
+drop procedure [dbo].[Usp_RecoverStandByDatabase]
+GO
+
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+create procedure 
+		Usp_RecoverStandByDatabase
+as
+begin
+
+	/* declare local variables */
+	/* ----------------------- */
+	declare @object 		int
+	declare @src 			varchar(255)
+	declare @desc 			varchar(255)
+	declare @hr			int
+	declare @lsDBName		sysname
+	declare @lsCommand		varchar(4000)
+	declare @liRetry		int
+	declare @liRestoreAction	int
+	declare @lsSecondarySQLServerName	varchar(50)
+	
+	/* declare a cursor to get the list of all the user database on the secondary server */
+	/* --------------------------------------------------------------------------------- */
+	declare 
+		lcurDBList
+	cursor for
+		select 
+			name 
+		from 
+			master..sysdatabases 
+		where 
+			lower(name) not in ('master','model','msdb','tempdb','pubs','northwind','sqlhelpdesk')
+
+
+	/* get the secondary server name */
+	/* ----------------------------- */
+	select @lsSecondarySQLServerName = @@SERVERNAME
+
+	/* create an instance of secondary server */
+	/* -------------------------------------- */
+	EXEC @hr = sp_OACreate 'SQLDMO.SQLServer', @object OUT
+	IF @hr <> 0 goto DestroyObj
+
+	/* connect to the secondary server */
+	/* ------------------------------- */
+	EXEC @hr = sp_OASetProperty @object, 'LoginSecure',True
+	IF @hr <> 0 goto DestroyObj
+
+	set @liRetry = 1
+	set @hr = 1
+	while (@liRetry <= 5 and @hr <> 0)
+	begin
+		EXEC @hr = sp_OAMethod @object, 'Connect', NULL, @lsSecondarySQLServerName
+		if @hr <> 0 waitfor delay '000:00:15'
+		set @liRetry = @liRetry + 1
+	end
+	IF @hr <> 0 goto DestroyObj
+
+	/* Recover all the user databases on the secondary server */
+	/* ------------------------------------------------------ */
+	open lcurDBlist
+	fetch next from
+		lcurDBlist
+	into
+		@lsDBName
+
+	while (@@fetch_status = 0)
+	begin
+	
+		select @lsCommand = 'ExecuteImmediate("Restore Database '+@lsDBName + ' With Recovery")'
+		EXEC @hr = sp_OAMethod @object,@lsCommand
+		IF @hr <> 0 goto DestroyObj
+
+		fetch next from
+			lcurDBlist
+		into
+			@lsDBName
+	end
+
+	/* disconnect and destroy the instance of secondary server */
+	/* ------------------------------------------------------- */
+	EXEC @hr = sp_OAMethod @object, 'DisConnect'
+	EXEC @hr = sp_OADestroy @object
+
+	close lcurDBlist
+	deallocate lcurDBlist
+
+	/* Destroy the sql server object */
+	/* ----------------------------- */
+	DestroyObj:
+	IF @hr <> 0
+	BEGIN
+		EXEC sp_OAGetErrorInfo @object, @src OUT, @desc OUT 
+		exec master..xp_logEvent 60000,@src,Error
+		exec master..xp_logEvent 60000,@desc,Error
+
+		exec master..xp_logevent 60000,@lsSecondarySQLServerName,Error
+		exec master..xp_logevent 60000,@lsDBname,Error
+		exec master..xp_logevent 60000,'Error while executing Usp_RecoverStandByDatabase procedure...',Error
+
+		close lcurDBlist
+		deallocate lcurDBlist
+	END
+	EXEC @hr = sp_OAMethod @object, 'DisConnect'
+	EXEC @hr = sp_OADestroy @object
+
+end
+-- usp_RecoverStandByDatabase
+-- master..xp_readerrorlog
+-- sp_cycle_errorlog
+
+GO
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+
+/* create the RestoreDBForStandBY job */
+/* ---------------------------------- */
+BEGIN TRANSACTION            
+  DECLARE @JobID BINARY(16)  
+  DECLARE @ReturnCode INT    
+  SELECT @ReturnCode = 0     
+IF (SELECT COUNT(*) FROM msdb.dbo.syscategories WHERE name = N'[Uncategorized (Local)]') < 1 
+  EXECUTE msdb.dbo.sp_add_category @name = N'[Uncategorized (Local)]'
+
+  -- Delete the job with the same name (if it exists)
+  SELECT @JobID = job_id     
+  FROM   msdb.dbo.sysjobs    
+  WHERE (name = N'RestoreDBForStandBy')       
+  IF (@JobID IS NOT NULL)    
+  BEGIN  
+  -- Check if the job is a multi-server job  
+  IF (EXISTS (SELECT  * 
+              FROM    msdb.dbo.sysjobservers 
+              WHERE   (job_id = @JobID) AND (server_id <> 0))) 
+  BEGIN 
+    -- There is, so abort the script 
+    RAISERROR (N'Unable to import job ''RestoreDBForStandBy'' since there is already a multi-server job with this name.', 16, 1) 
+    GOTO QuitWithRollback  
+  END 
+  ELSE 
+    -- Delete the [local] job 
+    EXECUTE msdb.dbo.sp_delete_job @job_name = N'RestoreDBForStandBy' 
+    SELECT @JobID = NULL
+  END 
+
+BEGIN 
+
+  -- Add the job
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_job @job_id = @JobID OUTPUT , @job_name = N'RestoreDBForStandBy', @owner_login_name = N'sa', @description = N'This job takes a full backup of all the user databases on the primary server and restores it on to the secondary server once every day.', @category_name = N'[Uncategorized (Local)]', @enabled = 1, @notify_level_email = 0, @notify_level_page = 0, @notify_level_netsend = 0, @notify_level_eventlog = 2, @delete_level= 0
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job steps
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 1, @step_name = N'RestoreDBForStandByStep', @command = N'exec master..Usp_RestoreForStandByWithMove 
+	''PrimaryServerName'',
+	''SecondaryServerName'',
+	''DB'',
+	''TRUE'',
+	''Y'',
+	''SecondaryServerDataDrive''
+	', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 1, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_update_job @job_id = @JobID, @start_step_id = 1 
+
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job schedules
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id = @JobID, @name = N'RestoreDBForStandBySchedule', @enabled = 1, @freq_type = 4, @active_start_date = 20020627, @active_start_time = 210000, @freq_interval = 1, @freq_subday_type = 1, @freq_subday_interval = 10, @freq_relative_interval = 0, @freq_recurrence_factor = 0, @active_end_date = 99991231, @active_end_time = 235959
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the Target Servers
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @JobID, @server_name = N'(local)' 
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+END
+COMMIT TRANSACTION          
+GOTO   EndSave              
+QuitWithRollback:
+  IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION 
+EndSave: 
+
+
+GO
+
+/* create the RestoreLogForStandByJob */
+/* ---------------------------------- */
+BEGIN TRANSACTION            
+  DECLARE @JobID BINARY(16)  
+  DECLARE @ReturnCode INT    
+  SELECT @ReturnCode = 0     
+IF (SELECT COUNT(*) FROM msdb.dbo.syscategories WHERE name = N'[Uncategorized (Local)]') < 1 
+  EXECUTE msdb.dbo.sp_add_category @name = N'[Uncategorized (Local)]'
+
+  -- Delete the job with the same name (if it exists)
+  SELECT @JobID = job_id     
+  FROM   msdb.dbo.sysjobs    
+  WHERE (name = N'RestoreLOGForStandBy')       
+  IF (@JobID IS NOT NULL)    
+  BEGIN  
+  -- Check if the job is a multi-server job  
+  IF (EXISTS (SELECT  * 
+              FROM    msdb.dbo.sysjobservers 
+              WHERE   (job_id = @JobID) AND (server_id <> 0))) 
+  BEGIN 
+    -- There is, so abort the script 
+    RAISERROR (N'Unable to import job ''RestoreLOGForStandBy'' since there is already a multi-server job with this name.', 16, 1) 
+    GOTO QuitWithRollback  
+  END 
+  ELSE 
+    -- Delete the [local] job 
+    EXECUTE msdb.dbo.sp_delete_job @job_name = N'RestoreLOGForStandBy' 
+    SELECT @JobID = NULL
+  END 
+
+BEGIN 
+
+  -- Add the job
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_job @job_id = @JobID OUTPUT , @job_name = N'RestoreLOGForStandBy', @owner_login_name = N'sa', @description = N'This jobs takes the backup of the transaction logs of all the user databases on the primary server and restores it on to the secondary server every 15 minutes.', @category_name = N'[Uncategorized (Local)]', @enabled = 1, @notify_level_email = 0, @notify_level_page = 0, @notify_level_netsend = 0, @notify_level_eventlog = 2, @delete_level= 0
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job steps
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 1, @step_name = N'RestoreLOGForStandByStep', @command = N'exec master..Usp_RestoreForStandByWithMove 
+	''PrimaryServerName'',
+	''SecondaryServerName'',
+	''LOG'',
+	''TRUE'',
+	''Y'',
+	''SecondaryServerDataDrive''', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 1, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_update_job @job_id = @JobID, @start_step_id = 1 
+
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job schedules
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id = @JobID, @name = N'RestoreLOGForStandBySchedule', @enabled = 1, @freq_type = 4, @active_start_date = 20020627, @active_start_time = 220000, @freq_interval = 1, @freq_subday_type = 4, @freq_subday_interval = 15, @freq_relative_interval = 0, @freq_recurrence_factor = 0, @active_end_date = 99991231, @active_end_time = 203000
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the Target Servers
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @JobID, @server_name = N'(local)' 
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+END
+COMMIT TRANSACTION          
+GOTO   EndSave              
+QuitWithRollback:
+  IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION 
+EndSave: 
+
+GO
+
+/* create the FailoverToSecondary job */
+/* ---------------------------------- */
+BEGIN TRANSACTION            
+  DECLARE @JobID BINARY(16)  
+  DECLARE @ReturnCode INT    
+  SELECT @ReturnCode = 0     
+IF (SELECT COUNT(*) FROM msdb.dbo.syscategories WHERE name = N'[Uncategorized (Local)]') < 1 
+  EXECUTE msdb.dbo.sp_add_category @name = N'[Uncategorized (Local)]'
+
+  -- Delete the job with the same name (if it exists)
+  SELECT @JobID = job_id     
+  FROM   msdb.dbo.sysjobs    
+  WHERE (name = N'FailoverToSecondary')       
+  IF (@JobID IS NOT NULL)    
+  BEGIN  
+  -- Check if the job is a multi-server job  
+  IF (EXISTS (SELECT  * 
+              FROM    msdb.dbo.sysjobservers 
+              WHERE   (job_id = @JobID) AND (server_id <> 0))) 
+  BEGIN 
+    -- There is, so abort the script 
+    RAISERROR (N'Unable to import job ''FailoverToSecondary'' since there is already a multi-server job with this name.', 16, 1) 
+    GOTO QuitWithRollback  
+  END 
+  ELSE 
+    -- Delete the [local] job 
+    EXECUTE msdb.dbo.sp_delete_job @job_name = N'FailoverToSecondary' 
+    SELECT @JobID = NULL
+  END 
+
+BEGIN 
+
+  -- Add the job
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_job @job_id = @JobID OUTPUT , @job_name = N'FailoverToSecondary', @owner_login_name = N'sa', @description = N'This jobs recovers and changes the status of all the user database on the secondary server from StandBy to OnLine. Run this job to fail over the database to the secondary server. It also disables the restore jobs.', @category_name = N'[Uncategorized (Local)]', @enabled = 0, @notify_level_email = 0, @notify_level_page = 0, @notify_level_netsend = 0, @notify_level_eventlog = 2, @delete_level= 0
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job steps
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 1, @step_name = N'FailoverToSecondaryStep', @command = N'exec master..Usp_RecoverStandByDatabase', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 3, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 2, @step_name = N'DisableTheRestoreDBJobStep', @command = N'EXEC msdb..sp_Update_job 
+	@job_name = ''RestoreDBForStandBy'',
+	@enabled=0
+', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 3, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 3, @step_name = N'DisableTheRestoreLogJobStep', @command = N'EXEC msdb..sp_Update_job 
+	@job_name = ''RestoreLOGForStandBy'',
+	@enabled=0
+', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 1, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_update_job @job_id = @JobID, @start_step_id = 1 
+
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the Target Servers
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @JobID, @server_name = N'(local)' 
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+END
+COMMIT TRANSACTION          
+GOTO   EndSave              
+QuitWithRollback:
+  IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION 
+EndSave: 
+
+GO
+
+/* create the FailoverToPrimary job */ 
+/* -------------------------------- */
+BEGIN TRANSACTION            
+  DECLARE @JobID BINARY(16)  
+  DECLARE @ReturnCode INT    
+  SELECT @ReturnCode = 0     
+IF (SELECT COUNT(*) FROM msdb.dbo.syscategories WHERE name = N'[Uncategorized (Local)]') < 1 
+  EXECUTE msdb.dbo.sp_add_category @name = N'[Uncategorized (Local)]'
+
+  -- Delete the job with the same name (if it exists)
+  SELECT @JobID = job_id     
+  FROM   msdb.dbo.sysjobs    
+  WHERE (name = N'FailoverToPrimary')       
+  IF (@JobID IS NOT NULL)    
+  BEGIN  
+  -- Check if the job is a multi-server job  
+  IF (EXISTS (SELECT  * 
+              FROM    msdb.dbo.sysjobservers 
+              WHERE   (job_id = @JobID) AND (server_id <> 0))) 
+  BEGIN 
+    -- There is, so abort the script 
+    RAISERROR (N'Unable to import job ''FailoverToPrimary'' since there is already a multi-server job with this name.', 16, 1) 
+    GOTO QuitWithRollback  
+  END 
+  ELSE 
+    -- Delete the [local] job 
+    EXECUTE msdb.dbo.sp_delete_job @job_name = N'FailoverToPrimary' 
+    SELECT @JobID = NULL
+  END 
+
+BEGIN 
+
+  -- Add the job
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_job @job_id = @JobID OUTPUT , @job_name = N'FailoverToPrimary', @owner_login_name = N'sa', @description = N'This job transfers the data from the secondary server to the primary server and setups the secondary server again as the standby server by enabiling the restore jobs.', @category_name = N'[Uncategorized (Local)]', @enabled = 0, @notify_level_email = 0, @notify_level_page = 0, @notify_level_netsend = 0, @notify_level_eventlog = 2, @delete_level= 0
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the job steps
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 1, @step_name = N'FailoverToPrimaryStep', @command = N'exec master..Usp_RestoreForStandbyWithMove
+		''SecondaryServerName'',
+		''PrimaryServerName'',
+		''DB'',
+		''FALSE'',
+		''Y'',
+		''PrimaryServerDataDrive''', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 3, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 2, @step_name = N'StartRestoreDBForStandByJobStep', @command = N'EXEC msdb..sp_start_job @job_name = ''RestoreDBForStandBy''', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 3, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 3, @step_name = N'EnableTheRestoreDBJobsStep', @command = N'EXEC msdb..sp_Update_job 
+	@job_name = ''RestoreDBForStandBy'',
+	@enabled=1
+
+', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 3, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobstep @job_id = @JobID, @step_id = 4, @step_name = N'EnableTheRestoreLogJobStep', @command = N'EXEC msdb..sp_Update_job 
+	@job_name = ''RestoreLOGForStandBy'',
+	@enabled=1', @database_name = N'master', @server = N'', @database_user_name = N'', @subsystem = N'TSQL', @cmdexec_success_code = 0, @flags = 0, @retry_attempts = 0, @retry_interval = 1, @output_file_name = N'', @on_success_step_id = 0, @on_success_action = 1, @on_fail_step_id = 0, @on_fail_action = 2
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+  EXECUTE @ReturnCode = msdb.dbo.sp_update_job @job_id = @JobID, @start_step_id = 1 
+
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+  -- Add the Target Servers
+  EXECUTE @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @JobID, @server_name = N'(local)' 
+  IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback 
+
+END
+COMMIT TRANSACTION          
+GOTO   EndSave              
+QuitWithRollback:
+  IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION 
+EndSave: 
+
+GO
+
+/* Start the RestoreDBForStandBy job to start the restore */
+/* ------------------------------------------------------ */
+EXEC msdb..sp_start_job @job_name = 'RestoreDBForStandBy'
+
+GO
+

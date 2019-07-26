@@ -1,0 +1,113 @@
+Execute SQL Script against Multiple Servers by PowerShell
+
+http://www.sqlservercentral.com/scripts/powershell/129948/
+
+ 1) Create a folder D:\ExecScriptOnMultiServer
+2) Create a .txt and write down all your SQL Instance name like below..
+    SQLInstanceName1
+    SQLInstanceName2
+    SQLInstanceName3
+Save the txt file in safe location. D:\ExecScriptOnMultiServer\ServerList.txt
+3) Save the powershell script in folder "D:\ExecScriptOnMultiServer\ExecuteQueryOnMultiServers.ps1"
+4) Create a .sql file and write a SQL script in it which you want to run on all servers mentioned in ServerList text file.
+Save the SQL script in location.  D:\ExecScriptOnMultiServer\SQLQuery.sql
+For Example.. suppose here I want to extract version, edition, SP and cluster node information for some of the servers, so i will write below SQL script in file "SQLQuery.sql"
+-----------------------------------------------------------------------------------
+declare @Nodes Varchar(100)
+set @Nodes=''
+ if (SERVERPROPERTY('IsClustered') = 1)
+begin
+select @Nodes=@Nodes+ NodeName  
++',' from sys.dm_os_cluster_nodes order by NodeName
+set @Nodes=substring(@Nodes,0,LEN(@Nodes))
+select 
+@Nodes as HostName, 
+SQLInstanceName = @@SERVERNAME,
+'Yes' as IsClustered,
+CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(50)) As ActiveNode,
+SERVERPROPERTY('edition') As SQLEdition,
+Case 
+  when cast(serverproperty('productversion') as varchar) like '8.%' then 'SQL2000'
+       when cast(serverproperty('productversion') as varchar) like '9.%' then 'SQL2005'
+       when cast(serverproperty('productversion') as varchar)  like '10.0%' then 'SQL2008'
+       when cast(serverproperty('productversion') as varchar)  like '10.50.%' then 'SQL2008R2'
+       when cast(serverproperty('productversion') as varchar)  like '11.%' then 'SQL2012'
+  when cast(serverproperty('productversion') as varchar)  like '12.%' then 'SQL2014'
+       ELSE 'SQL7.0' END +' '+
+  cast(SERVERPROPERTY('productlevel') as varchar(50))+' ('+ cast(SERVERPROPERTY('productversion') as varchar(50)) + ')' as SQLVersion
+end
+ else 
+begin
+select @Nodes=CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS VARCHAR(50)) 
+select 
+@Nodes as HostName, 
+SQLInstanceName = @@SERVERNAME,
+'No' as IsClustered,
+SERVERPROPERTY('edition') As SQLEdition,
+Case 
+  when cast(serverproperty('productversion') as varchar) like '8.%' then 'SQL2000'
+       when cast(serverproperty('productversion') as varchar) like '9.%' then 'SQL2005'
+       when cast(serverproperty('productversion') as varchar)  like '10.0%' then 'SQL2008'
+       when cast(serverproperty('productversion') as varchar)  like '10.50.%' then 'SQL2008R2'
+       when cast(serverproperty('productversion') as varchar)  like '11.%' then 'SQL2012'
+  when cast(serverproperty('productversion') as varchar)  like '12.%' then 'SQL2014'
+       ELSE 'SQL7.0' END +' '+
+  cast(SERVERPROPERTY('productlevel') as varchar(50))+' ('+ cast(SERVERPROPERTY('productversion') as varchar(50)) + ')' as SQLVersion
+end
+-----------------------------------------------------------------------------------
+5) Start windows powershell with the run as administrator option.
+6) Run the below command on windows powershell prompt like below. 
+
+PS C:\>D:\ExecScriptOnMultiServer\ExecuteQueryOnMultiServers.ps1
+
+command prompt will show you one by one server names for which script successfully executed. once all done. you will see
+below file which will contain the output of the script for all the servers.
+
+
+*******************************************
+D:\ExecScriptOnMultiServer\QueryOutput.txt 
+*******************************************
+
+Enjoy the Power of PowerShell.. Happy Learning :-)
+
+
+
+##Save the below powershell script in folder "D:\ExecScriptOnMultiServer\ExecuteQueryOnMultiServers.ps1"
+
+$QueryPath= "D:\ExecScriptOnMultiServer\SQLQuery.sql"
+$OutputFile = "D:\ExecScriptOnMultiServer\QueryOutput.txt"
+
+$ExecuteQuery= Get-Content -path $QueryPath | out-string
+
+"Results -- > `r`n`r`n" > $OutputFile
+
+FOREACH($server in GC "D:\ExecScriptOnMultiServer\ServerList.txt")
+ {
+	$server 
+
+	"---------------------------------------------------------------------------------------------------------" >> $OutputFile
+	$server >> $OutputFile
+	"---------------------------------------------------------------------------------------------------------" >> $OutputFile
+	invoke-sqlcmd -ServerInstance $server -query $ExecuteQuery -querytimeout 65534 | ft -autosize | out-string -width 4096 >> $OutputFile
+ }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

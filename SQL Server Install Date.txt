@@ -1,0 +1,106 @@
+ This script is compatible for both SQL 2000 and SQL 2005.
+This is handy script which could be used to find the SQL Instance install date.
+For SQL 2005 it lists out the individual install date like SQL Server, Integration Services.
+Note : if there exists problem copying the code directly to Query Analyzer or SSMS.
+Please copy it to wordpad/Word, from there copy to your query window.--Find SQL Server Install Date
+
+/*
+This script is compatible for both SQL 2000 and SQL 2005.
+This is handy script which could be used to find the SQL Instance install date.
+For SQL 2005 it lists out the individual install date like SQL Server, Integration Services.
+Note : if there exists problem copying the code directly to Query Analyzer or SSMS.
+Please copy it to wordpad/Word, from there copy to your query window.
+*/
+
+--SQL 2000/2005 Version
+
+set nocount on
+go
+DECLARE @SQLVersion varchar(2)
+select @SQLVersion = left(CAST(SERVERPROPERTY('ProductVersion')AS sysname),1)
+if @SQLVersion = '9'
+BEGIN
+--SQL 2005
+
+
+DECLARE @InstallDate nvarchar(4000)
+DECLARE @svr_name varchar(100)
+DECLARE @reg_key varchar(500)
+DECLARE @ServiceName VARCHAR(8000)
+Declare @ServicesList VARCHAR(8000) -- List of delimited items
+declare @counter int
+declare @sql nvarchar(4000)
+declare @displayname varchar(200)
+
+select @svr_name = CAST(SERVERPROPERTY('ServerName')AS sysname)
+set @reg_key = 'SOFTWARE\Microsoft\Microsoft SQL Server\90\Bootstrap\MSIRefCount'
+EXEC master..xp_regread @rootkey='HKEY_LOCAL_MACHINE', 
+@key=@reg_key, @value_name='Uninstall',
+@value=@InstallDate output
+
+set @ServicesList = @installDate
+create table #list(id int identity(1,1),item VARCHAR(8000))
+WHILE CHARINDEX(',',@ServicesList,0) <> 0
+BEGIN
+SELECT
+@ServiceName=RTRIM(LTRIM(SUBSTRING(@ServicesList,1,CHARINDEX(',',@ServicesList,0)-1))),
+@ServicesList=RTRIM(LTRIM(SUBSTRING(@ServicesList,CHARINDEX(',',@ServicesList,0)+LEN(','),LEN(@ServicesList))))
+
+IF LEN(@ServiceName) > 0
+INSERT INTO #List SELECT @ServiceName
+END
+
+
+IF LEN(@ServicesList) > 0
+INSERT INTO #List SELECT @ServicesList -- Put the last item in
+create table #servicelist (ServiceName varchar(200),InstallDate varchar(50))
+select @counter = max(id) from #list
+while @counter > 0
+BEGIN
+select @sql = item from #list where id = @counter
+set @reg_key = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + @sql
+EXEC master..xp_regread @rootkey='HKEY_LOCAL_MACHINE', 
+@key=@reg_key, @value_name='DisplayName',
+@value=@displayname output
+EXEC master..xp_regread @rootkey='HKEY_LOCAL_MACHINE', 
+@key=@reg_key, @value_name='InstallDate',
+@value=@InstallDate output
+
+insert into #servicelist values (@displayname,@installdate)
+SET @COUNTER = @COUNTER - 1
+END
+
+select @svr_name AS 'ServerName',s.servicename as 'ServericeName',cast(s.installdate as DateTime) as 'InstallDate' from #servicelist s
+drop table #list
+drop table #servicelist
+END
+go
+
+
+DECLARE @SQLVersion varchar(2)
+select @SQLVersion = left(CAST(SERVERPROPERTY('ProductVersion')AS sysname),1)
+IF @SQLVersion = '8'
+BEGIN
+--SQL 2000
+DECLARE @Installdate varchar(50)
+DECLARE @svr_name varchar(100)
+DECLARE @reg_key varchar(500)
+DECLARE @instance_name varchar(20)
+
+select @svr_name = CAST(SERVERPROPERTY('ServerName')AS sysname)
+select @instance_name = CAST(SERVERPROPERTY('instancename')AS sysname)
+if @instance_name is NULL
+BEGIN
+set @reg_key = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft SQL Server 2000'
+END
+ELSE BEGIN
+set @reg_key = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft SQL Server 2000 (' + @instance_name + ')'
+END
+EXEC master..xp_regread @rootkey='HKEY_LOCAL_MACHINE', 
+@key=@reg_key, @value_name='InstallDate',
+@value=@installdate output
+select @svr_name as 'ServerName','Microsoft SQL Server 2000' as Servicename, cast(@installdate as DateTime) as 'InstallDate'
+END
+go
+
+

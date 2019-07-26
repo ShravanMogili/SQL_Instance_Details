@@ -1,0 +1,68 @@
+Find SQL Services and Accounts
+
+http://www.sqlservercentral.com/scripts/powershell/135199/
+
+ 	
+
+Get your favorite SSC scripts directly in SSMS with the free SQL Scripts addin. Search for scripts directly from SSMS, and instantly access any saved scripts in your SSC briefcase from the favorites tab.
+Download now (direct download link)
+
+Thank this author by sharing:
+0
+
+     Rate this   Join the discussion   Add to briefcase 
+
+Find SQL Services and Accounts
+
+By Michael D'Spain , 2015/12/18
+
+If you need to find the service account for SQL and the SQL Agent across the enterprise, this script will do the trick.   It does require a list of Servers in which to iterate through.   I have a repository database of servers and used that as my source list of servers but if you have that list in a text file use the get-content cmdlet to populate the Instance variable   
+
+Get-WmiObject win32_service will provide the necessary data for the services in question.   Startname is the name of the Service Account. 
+
+After the out-file cmdlet, enter a filepath and name of the file.  This script creates a pipe delimited list.   I could have used export-csv but this worked just fine.  
+
+Enjoy!!
+
+http://thesurfingdba.weebly.com/
+
+
+
+
+##initialize variable 
+$Instance = $()
+##list of serverrs to iterate through. this could be a tex file of servers, example get-content c:\listofservers.txt
+
+$Instance = invoke-sqlcmd -ServerInstance <SQL Server Envirorment Repository> -Database <Repo DB> -query "<Select Servername from Server Repository>" -SuppressProviderContextWarning 
+##counter
+$i =1
+$count = $Instance.count
+##header for text file.  guess i could have done export-csv but anyway this works
+"Server"+"|"+"SQL Service"+"|"+"SQL Service Account"+"|"+"SQL Agent"+"|"+"SQL Agent Account" | out-file C:\Users\mdspain\Desktop\Services5.txt
+
+
+foreach($Server in $Instance){
+##make sure you have a object that can be used as a string and not a datarow object
+$computer = $($Server.Servername)
+
+
+## find sql server services and service accounts 
+$Service = Get-WmiObject win32_service -ComputerName $computer  | where {$_.Name -eq 'MSSQLServer' -or $_.Name -eq 'SQLSERVERAGENT' } 
+
+
+##write counter to screen(I hate looking at a blank screen)
+write-host $i"..of.."$count
+
+
+##create text file and append each iteration to that file 
+ $computer +"|"+$($Service[0].name) +"|" +$($Service[0].startname) +"|"+$($Service[1].name)+ "|"+$($Service[1].startname ) |  out-file C:\<filepath\name of file.txt> -Append
+
+
+$i++
+}
+
+
+
+
+
+

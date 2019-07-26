@@ -1,0 +1,8 @@
+Automating Daily Checks with Powershell --> http://www.sqlservercentral.com/articles/powershell/76561/
+
+
+Execute SQL Script against Multiple Servers by PowerShell --> http://www.sqlservercentral.com/scripts/powershell/129948/
+
+Scripting SQL jobs using PowerShell --> 
+
+amitbakshi@in.ibm.com

@@ -1,0 +1,139 @@
+ This script monitors that two instances of SQL are not running on the same node in an active/active cluster configuration.  I run this as a SQL Server Agent job every 30 minutes.
+
+Notes:
+
+*xp_cmdshell must be enabled
+
+*best to run it from a server that is not a member of the cluster
+
+*change @svrName to your server
+
+*change #tmpTable names to match your server
+
+This script can also be easily modified to use a cursor and read from a table if you have multiple active/active clusters
+
+
+/***********************************************************************************************************
+
+	Monitors the DB23 cluster to determine if SQL/Prod and SQL/UAT are on the same node; uses a WQL to make a WMI query
+
+	Version 1.0
+		31 Oct 2013
+
+		Gregory A. Ferdinandsen
+		gregory.ferdinandsen@recall.com
+		greg@ferdinandsen.com
+
+***********************************************************************************************************/
+create procedure [dbo].[sp_MonitorDB23Cluster]
+
+as
+
+	declare @SQLInstance_name as varchar(128)
+	declare @svrName as varchar(255)
+	declare @SQLCmd as varchar(512)
+	declare @ServicesRunning as smallint
+	declare @Subject as varchar(128)
+	declare @Body as varchar(2048)
+
+	--#table to store PS script output
+	if exists(select name from tempdb.sys.objects where name = '#outputDB23') drop table #outputDB23
+	if exists(select name from tempdb.sys.objects where name = '#SQLStatusDB23') drop table #SQLStatusDB23
+
+	create table #OutputDB23
+		(
+		[data] varchar(max) null
+		)
+
+	create table #SQLStatusDB23
+		(
+		[ServiceName] varchar(512) null,
+		[ServiceStatus] varchar(128) null,
+		[ServerName] varchar(512) null,
+		[StartMode] varchar(128) null,
+		[UpdateDate] datetime null,
+		[StartAcct] varchar(1024) null
+		)
+
+		--ServerName can be either active node
+		set @svrName = 'amatldb23'
+
+		--preparing PS statement
+		/***********************************************************************************************************
+			PowerShell.exe -c "Get-WmiObject  -ComputerName 'amatldb23' -Class win32_service |  where {$_.name -like '*MSSQL*'} | select-object name, state, systemname, startmode, startname  | foreach{$_.name+'|'+$_.state+'%'+$_.systemname+'*'+$_.startmode+'@'+$_.startname+'!'}"
+		***********************************************************************************************************/
+		set @SQLCmd = 'PowerShell.exe -c "Get-WmiObject  -ComputerName ' + quotename(@svrName,'''') + ' -Class win32_service |  where {$_.name -like ' + 
+			quotename('*MSSQL*','''') + '} | select-object name, state, systemname, startmode, startname  | foreach{$_.name+''|''+$_.state+''%''+$_.systemname+''*''+$_.startmode+''@''+$_.startname+''!''}"'
+
+		--inserting PS Output to #tmpTable
+		insert #outputDB23
+			exec xp_cmdshell @SQLCmd
+
+		/***********************************************************************************************************
+					Examples of the raw [data]:
+						MSSQL$UAT|Stopped%AMATLWCDB33*Manual@DOMAIN\SQL!
+						MSSQLSERVER|Running%AMATLWCDB33*Manual@domain\sql!
+
+					Exampe of an invalid Server Name/Server unavailable:
+						Get-WmiObject : The RPC server is unavailable. (Exception from HRESULT: 0x800706BA)
+		***********************************************************************************************************/
+
+		--delete the rows which contain an error or do not have a sufficient quantity of data
+		delete from #outputDB23
+			where len(data) < 30
+		update #outputDB23
+			set data = data + '!'
+			where data not like '%!%'
+
+		--insert formatted data into #SQLStatusDB23
+		if (select count(*) from #outputDB23 where data like '%Get-Wmi%') = 0
+			begin
+				insert into #SQLStatusDB23
+				(SQLServiceName, ServiceStatus, WindowServerName, StartMode, StartName, InstanceName)
+				select rtrim(ltrim(substring(data, 1, charindex('|', data) -1))) as SQLServiceName,
+					(rtrim(ltrim(substring(data, charindex('|', data) + 1, (charindex('%', data) - 1) - charindex('|', data))))) as ServiceStatus,
+					@svrName,
+					(rtrim(ltrim(substring(data, charindex('*', data) + 1, (charindex('@', data) - 1) - charindex('*', data))))) as StartMode,
+					(rtrim(ltrim(substring(data, charindex('@', data) + 1, (charindex('!', data) - 1) - charindex('@', data))))) as StartName,
+					@SQLInstance_name
+				from #outputDB23
+				where data is not null and len(data) > 30
+			end
+
+		truncate table #outputDB23
+
+		drop table #outputDB23
+
+		--delete all services from the #tmpTable that are not SQL
+		delete from #SQLStatusDB23 where SQLServiceName not in ('MSSQL$UAT', 'MSSQLSERVER')
+		select * from #SQLStatusDB23
+
+		select @ServicesRunning = count(*)
+			from #SQLStatusDB23
+			where ServiceStatus = 'Running'
+
+		if @ServicesRunning > 1
+			begin
+				set @Subject = 'WARNING: SQL/Prod and SQL/UAT are on the same node'
+				set @Body = 'SQL/Prod and SQL/UAT are both running on ' + @svrName + '; please fail over one service to the other node.'
+
+				exec msdb..sp_send_dbmail
+					@Recipients = '',
+					@Subject = @Subject,
+					@Body = @Body,
+					@Importance = 'high',
+					@Body_Format = 'HTML'
+
+				--Write the event data to server event log
+				begin try
+					exec master..xp_logevent 55001, @Body, 'Error'
+				end try
+
+				begin catch
+					print 'Error writing to event log'
+				end catch
+		end
+
+		drop table #SQLStatusDB23
+
+

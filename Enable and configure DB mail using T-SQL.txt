@@ -1,0 +1,46 @@
+--Enable and configure DB mail using T-SQL
+
+--enable DB mail ------------------------------------------------------------------------------------
+DECLARE @lsServerName VARCHAR(2000)
+DECLARE @lsMessage VARCHAR(2000)
+
+SET @lsServerName = @@SERVERNAME
+SET @lsMessage = 'Email configured for: ' + @lsServerName 
+
+--enable DBMail feature
+EXEC sys.sp_configure N'Database Mail XPs', N'1'
+RECONFIGURE WITH OVERRIDE
+
+--create mail profile
+EXEC msdb.dbo.sysmail_add_profile_sp @profile_name=N'SQLServerMail_Default', 
+		@description=N'Default method for sending database mail through the DBAlerts email address.'
+
+--create service account for mail profile
+EXECUTE msdb.dbo.sysmail_add_account_sp
+    @account_name = 'SQLServerMail', --the name of the mail account
+    @description = 'Mail account for administrative SQL Server e-mail.',-- this is optional
+    @email_address = 'email@company.com',--The email address that dbmail will use in sending out mails and alerts
+    @replyto_address = 'dbagroup@company.com',-- Optional. Use if you need a reply sent back to the mail account.
+    @display_name = @lsServerName,--The name you want displayed for the instance
+    @port = 2500,--Change this to the smtp port of your company of use 587 for gmail
+    @mailserver_name = 'smtp.company.com'; -- Use smtp.gmail.com for gmail accounts
+
+EXEC msdb.dbo.sysmail_add_profileaccount_sp @profile_name=N'SQLServerMail_Default', @account_name=N'SQLServerMail', @sequence_number=1
+EXEC msdb.dbo.sysmail_add_principalprofile_sp @principal_name=N'guest', @profile_name=N'SQLServerMail_Default', @is_default=1
+
+--set variables to send test emails
+SET @lsServerName = @@SERVERNAME
+SET @lsMessage = 'Email configured for: ' + @lsServerName -- This will be used as the body of the email
+
+--send test mail
+EXEC msdb.dbo.sp_send_dbmail  
+  @recipients='recipients@email.com, recipient2@email.com', -- Add multiple recipient email addresses separating each with a comma within the single quote.
+  @body=@lsMessage, 
+  @subject=@lsServerName, 
+  @file_attachments='', 
+  @copy_recipients='', 
+  @blind_copy_recipients='', 
+  @importance='high', 
+  @body_format='HTML', 
+  @profile_name='SQLServerMail_Default'  
+GO
